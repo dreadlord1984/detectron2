@@ -14,12 +14,14 @@ from fvcore.transforms.transform import (
     NoOpTransform,
     Transform,
     TransformList,
+    VFlipTransform,
 )
 from PIL import Image
 
-from .transform import ExtentTransform, ResizeTransform
+from .transform import ExtentTransform, ResizeTransform, RotationTransform
 
 __all__ = [
+    "RandomApply",
     "RandomBrightness",
     "RandomContrast",
     "RandomCrop",
@@ -27,6 +29,7 @@ __all__ = [
     "RandomFlip",
     "RandomSaturation",
     "RandomLighting",
+    "RandomRotation",
     "Resize",
     "ResizeShortestEdge",
     "TransformGen",
@@ -88,26 +91,22 @@ class TransformGen(metaclass=ABCMeta):
         "MyTransformGen(field1={self.field1}, field2={self.field2})"
         """
         try:
-            argspec = inspect.getargspec(self.__init__)
-            assert argspec.varargs is None, "The default __repr__ doesn't work for varargs!"
-            assert argspec.keywords is None, "The default __repr__ doesn't work for kwargs!"
-            fields = argspec.args[1:]
-            index_field_has_default = len(fields) - (
-                0 if argspec.defaults is None else len(argspec.defaults)
-            )
-
+            sig = inspect.signature(self.__init__)
             classname = type(self).__name__
             argstr = []
-            for idx, f in enumerate(fields):
-                assert hasattr(self, f), (
+            for name, param in sig.parameters.items():
+                assert (
+                    param.kind != param.VAR_POSITIONAL and param.kind != param.VAR_KEYWORD
+                ), "The default __repr__ doesn't support *args or **kwargs"
+                assert hasattr(self, name), (
                     "Attribute {} not found! "
-                    "Default __repr__ only works if attributes match the constructor.".format(f)
+                    "Default __repr__ only works if attributes match the constructor.".format(name)
                 )
-                attr = getattr(self, f)
-                if idx >= index_field_has_default:
-                    if attr is argspec.defaults[idx - index_field_has_default]:
-                        continue
-                argstr.append("{}={}".format(f, pprint.pformat(attr)))
+                attr = getattr(self, name)
+                default = param.default
+                if default is attr:
+                    continue
+                argstr.append("{}={}".format(name, pprint.pformat(attr)))
             return "{}({})".format(classname, ", ".join(argstr))
         except AssertionError:
             return super().__repr__()
@@ -115,33 +114,68 @@ class TransformGen(metaclass=ABCMeta):
     __str__ = __repr__
 
 
+class RandomApply(TransformGen):
+    """
+    Randomly apply the wrapper transformation with a given probability.
+    """
+
+    def __init__(self, transform, prob=0.5):
+        """
+        Args:
+            transform (Transform, TransformGen): the transform to be wrapped
+                by the `RandomApply`. The `transform` can either be a
+                `Transform` or `TransformGen` instance.
+            prob (float): probability between 0.0 and 1.0 that
+                the wrapper transformation is applied
+        """
+        super().__init__()
+        assert isinstance(transform, (Transform, TransformGen)), (
+            f"The given transform must either be a Transform or TransformGen instance. "
+            f"Not {type(transform)}"
+        )
+        assert 0.0 <= prob <= 1.0, f"Probablity must be between 0.0 and 1.0 (given: {prob})"
+        self.prob = prob
+        self.transform = transform
+
+    def get_transform(self, img):
+        do = self._rand_range() < self.prob
+        if do:
+            if isinstance(self.transform, TransformGen):
+                return self.transform.get_transform(img)
+            else:
+                return self.transform
+        else:
+            return NoOpTransform()
+
+
 class RandomFlip(TransformGen):
     """
-    Flip the image horizontally with the given probability.
-
-    TODO Vertical flip to be implemented.
+    Flip the image horizontally or vertically with the given probability.
     """
 
-    def __init__(self, prob=0.5):
+    def __init__(self, prob=0.5, *, horizontal=True, vertical=False):
         """
         Args:
             prob (float): probability of flip.
+            horizontal (boolean): whether to apply horizontal flipping
+            vertical (boolean): whether to apply vertical flipping
         """
-        horiz, vert = True, False
-        # TODO implement vertical flip when we need it
         super().__init__()
 
-        if horiz and vert:
+        if horizontal and vertical:
             raise ValueError("Cannot do both horiz and vert. Please use two Flip instead.")
-        if not horiz and not vert:
+        if not horizontal and not vertical:
             raise ValueError("At least one of horiz or vert has to be True!")
         self._init(locals())
 
     def get_transform(self, img):
-        _, w = img.shape[:2]
+        h, w = img.shape[:2]
         do = self._rand_range() < self.prob
         if do:
-            return HFlipTransform(w)
+            if self.horizontal:
+                return HFlipTransform(w)
+            elif self.vertical:
+                return VFlipTransform(h)
         else:
             return NoOpTransform()
 
@@ -198,6 +232,8 @@ class ResizeShortestEdge(TransformGen):
             size = np.random.randint(self.short_edge_length[0], self.short_edge_length[1] + 1)
         else:
             size = np.random.choice(self.short_edge_length)
+        if size == 0:
+            return NoOpTransform()
 
         scale = size * 1.0 / min(h, w)
         if h < w:
@@ -211,6 +247,57 @@ class ResizeShortestEdge(TransformGen):
         neww = int(neww + 0.5)
         newh = int(newh + 0.5)
         return ResizeTransform(h, w, newh, neww, self.interp)
+
+
+class RandomRotation(TransformGen):
+    """
+    This method returns a copy of this image, rotated the given
+    number of degrees counter clockwise around the given center.
+    """
+
+    def __init__(self, angle, expand=True, center=None, sample_style="range", interp=None):
+        """
+        Args:
+            angle (list[float]): If ``sample_style=="range"``,
+                a [min, max] interval from which to sample the angle (in degrees).
+                If ``sample_style=="choice"``, a list of angles to sample from
+            expand (bool): choose if the image should be resized to fit the whole
+                rotated image (default), or simply cropped
+            center (list[[float, float]]):  If ``sample_style=="range"``,
+                a [[minx, miny], [maxx, maxy]] relative interval from which to sample the center,
+                [0, 0] being the top left of the image and [1, 1] the bottom right.
+                If ``sample_style=="choice"``, a list of centers to sample from
+                Default: None, which means that the center of rotation is the center of the image
+                center has no effect if expand=True because it only affects shifting
+        """
+        super().__init__()
+        assert sample_style in ["range", "choice"], sample_style
+        self.is_range = sample_style == "range"
+        if isinstance(angle, (float, int)):
+            angle = (angle, angle)
+        if center is not None and isinstance(center[0], (float, int)):
+            center = (center, center)
+        self._init(locals())
+
+    def get_transform(self, img):
+        h, w = img.shape[:2]
+        center = None
+        if self.is_range:
+            angle = np.random.uniform(self.angle[0], self.angle[1])
+            if self.center is not None:
+                center = (
+                    np.random.uniform(self.center[0][0], self.center[1][0]),
+                    np.random.uniform(self.center[0][1], self.center[1][1]),
+                )
+        else:
+            angle = np.random.choice(self.angle)
+            if self.center is not None:
+                center = np.random.choice(self.center)
+
+        if center is not None:
+            center = (w * center[0], h * center[1])  # Convert to absolute coordinates
+
+        return RotationTransform(h, w, angle, expand=self.expand, center=center, interp=self.interp)
 
 
 class RandomCrop(TransformGen):
